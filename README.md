@@ -1,3 +1,9 @@
+**This repository is for the 2025 Spring AI502 Term Project at KAIST.  
+It is based on https://github.com/mit-han-lab/amc (MIT License), with modifications for academic purposes.  
+See below for original author and license information.**
+
+---
+
 # AutoML for Model Compression (AMC)
 
 This repo contains the PyTorch implementation for paper [**AMC: AutoML for Model Compression and Acceleration on Mobile Devices**](https://arxiv.org/abs/1802.03494). 
