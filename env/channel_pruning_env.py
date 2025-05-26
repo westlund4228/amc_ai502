@@ -43,6 +43,13 @@ class ChannelPruningEnv:
         self.export_model = export_model
         self.use_new_input = use_new_input
 
+        # record the pruning‐order names once
+        self.layer_names = [
+            name
+            for name, m in self.model.named_modules()
+            if isinstance(m, nn.Conv2d)
+            ]
+
         # Save the original model and checkpoint using deepcopy
         self.original_model = copy.deepcopy(model)
         self.original_checkpoint = copy.deepcopy(checkpoint)

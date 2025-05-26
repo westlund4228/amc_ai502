@@ -13,6 +13,10 @@ from env.channel_pruning_env import ChannelPruningEnv
 from lib.agent import DDPG
 from lib.utils import get_output_folder
 
+from sensitive_layer import SensitiveLayerFinder
+from torch.utils.data import DataLoader
+from lib.data import get_dataset
+
 from tensorboardX import SummaryWriter
 import pickle
 
@@ -140,8 +144,15 @@ def load_resume_state(agent, env, output):
 
 def train(num_episode, agent, env, output, start_episode=0):
     agent.is_training = True
+    initial_prune = 0.1
+    initial_preserve = 1.0 - initial_prune
+    noise_std0 = 0.2
+    noise_decay = 0.99
+    noise_std = noise_std0
+    ft_epochs = getattr(args, 'ft_epochs', 1)
     step = episode = episode_steps = 0
     episode_reward = 0.
+    best_acc = 0.0
     observation = None
     T = []
     episode = start_episode
@@ -150,17 +161,44 @@ def train(num_episode, agent, env, output, start_episode=0):
         if observation is None:
             observation = deepcopy(env.reset())
             agent.reset(observation)
+            current_layer = 0
+            clamped_actions = []
 
         # agent pick action ...
-        if episode <= args.warmup:
+        if episode == 0:
+            action = initial_preserve
+        elif episode <= args.warmup:
             action = agent.random_action()
             # action = sample_from_truncated_normal_distribution(lower=0., upper=1., mu=env.preserve_ratio, sigma=0.5)
         else:
             action = agent.select_action(observation, episode=episode)
 
+        action = float(action) + np.random.randn() * noise_std
+        action = float(np.clip(action, 0.0, 1.0))
+        noise_std *= noise_decay
+
         # env response with next_observation, reward, terminate_info
+        # clamp prune ratio for any sensitive layer to 10%
+        # clamp prune_rate = 1 - action  ≤ 0.1 → action ≥ 0.9
+        p_action = float(action)
+        #print(f"[DEBUG] layer {current_layer}'s action is {p_action:.3f}")
+
+        if current_layer in env.sensitive_ids:
+        	#print(f"[CLAMP] layer {current_layer} is sensitive, capping action {p_action:.3f}→0.9")
+        	action = max(action, initial_preserve)
+
+        W = sum(env.org_channels)
+        w_t = env.org_channels[current_layer]
+        W_reduced = sum(p * env.org_channels[i] for i, p in enumerate(clamped_actions))
+        W_rest = sum(env.org_channels[i] for i in range(current_layer+1, env.n_prunable_layer))
+        duty_preserve = (args.preserve_ratio * W - W_reduced - W_rest) / w_t
+        action = max(action, float(max(duty_preserve, 0.0)))
+
+        clamped_actions.append(action)
+
         observation2, reward, done, info = env.step(action)
         observation2 = deepcopy(observation2)
+        current_layer += 1
 
         T.append([reward, deepcopy(observation), deepcopy(observation2), action, done])
 
@@ -219,10 +257,15 @@ def train(num_episode, agent, env, output, start_episode=0):
 
             text_writer.write('best reward: {}\n'.format(env.best_reward))
             text_writer.write('best policy: {}\n'.format(env.best_strategy))
+
+            if info['accuracy'] > best_acc:
+            	best_acc = info['accuracy']
+            	env.best_strategy = clamped_actions.copy()
+            	print(f"New best clamped policy: {env.best_strategy}")
     text_writer.close()
     # Always save best policy and channels to best_policy.txt after training
     if hasattr(env, 'best_strategy') and hasattr(env, 'org_channels'):
-        best_ratios = env.best_strategy
+        best_ratios = [float(r) for r in env.best_strategy]
         org_channels = env.org_channels
         pruned_channels = [max(1, int(round(r * c))) for r, c in zip(best_ratios, org_channels)]
         policy_path = os.path.join(output, "best_policy.txt")
@@ -279,10 +322,32 @@ if __name__ == "__main__":
     model, checkpoint = get_model_and_checkpoint(args.model, args.dataset, checkpoint_path=args.ckpt_path,
                                                  n_gpu=args.n_gpu)
 
+    _, calib_loader, _ = get_dataset(args.dataset,
+	                                 batch_size=args.data_bsize,
+	                                 n_worker=args.n_worker,
+	                                 data_root=args.data_root)
+    calib_loader = DataLoader(calib_loader.dataset,
+	                          batch_size=args.data_bsize,
+	                          shuffle=True)
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    finder = SensitiveLayerFinder(model, calib_loader, device)
+    rank_exps = finder.compute_rank_expectations()
+    sensitive_layers = finder.identify_sensitive_layers(rank_exps)
+    print(f"Identified sensitive layers: {sensitive_layers}")
+
     env = ChannelPruningEnv(model, checkpoint, args.dataset,
                             preserve_ratio=1. if args.job == 'export' else args.preserve_ratio,
                             n_data_worker=args.n_worker, batch_size=args.data_bsize,
                             args=args, export_model=args.job == 'export', use_new_input=args.use_new_input)
+    env.sensitive_layers = sensitive_layers
+
+    sensitive_ids = []
+    for idx, name in enumerate(env.layer_names):
+    	if name in sensitive_layers:
+    		sensitive_ids.append(idx)
+    print("Sensitive layer indices:", sensitive_ids)
+    env.sensitive_ids = sensitive_ids
 
     if args.job == 'train':
         if args.resume != 'default':
